@@ -3,15 +3,17 @@ const axios = require('axios');
 const express = require('express');
 
 const app = express();
-app.get('/', (req, res) => res.send('RAPHAEL ONLINE'));
+app.get('/', (req, res) => res.send('RAPHAEL GLOBAL ONLINE'));
 app.listen(process.env.PORT || 3000);
 
 const token = '8692050432:AAGHsImArczpglBwM_u8gC5PHuYJOSI6n5A';
 const adminId = '8402118528';
 const bot = new TelegramBot(token, { polling: true });
 
-const users = {};
+const globalTrackedMatches = new Set();
+const activeChats = new Set();
 const matchStates = {};
+let isFetching = false;
 
 bot.on('polling_error', () => {});
 
@@ -20,12 +22,8 @@ const formatTurkishDate = (dateString) => {
     try {
         const d = new Date(dateString);
         return d.toLocaleString('tr-TR', { 
-            weekday: 'short', 
-            month: 'long', 
-            day: 'numeric', 
-            hour: '2-digit', 
-            minute: '2-digit', 
-            timeZone: 'Europe/Istanbul' 
+            weekday: 'short', month: 'long', day: 'numeric', 
+            hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Istanbul' 
         });
     } catch(e) { 
         return dateString; 
@@ -45,148 +43,98 @@ const translateStatus = (statusDetail, dateStr) => {
     return statusDetail;
 };
 
-const getMainMenu = (chatId) => {
-    const isActive = users[chatId]?.isActive ?? true;
-    const kb = [
-        [{ text: '🔍 Maç Ara', callback_data: 'search_match' }, { text: '📋 Listem', callback_data: 'list_tracked' }],
-        [{ text: `⚙️ Sistem: ${isActive ? 'AÇIK' : 'KAPALI'}`, callback_data: 'toggle_system' }]
-    ];
-    if (String(chatId) === adminId) {
-        kb.push([{ text: '👑 Admin Paneli', callback_data: 'admin_panel' }]);
-    }
-    return { reply_markup: { inline_keyboard: kb } };
-};
-
-const getUser = (chatId) => {
-    if (!users[chatId]) {
-        users[chatId] = { isActive: true, tracked: new Set(), state: 'idle' };
-    }
-    return users[chatId];
-};
-
 bot.onText(/\/(start|takip)/, (msg, match) => {
     const chatId = msg.chat.id;
-    const chatType = msg.chat.type;
-    const cmd = match[1];
+    activeChats.add(chatId);
 
-    getUser(chatId);
-
-    if (chatType !== 'private') {
-        if (cmd === 'takip') {
-            sendTrackedList(chatId);
-        }
-        return;
+    if (String(chatId) === adminId && match[1] === 'start') {
+        const kb = [
+            [{ text: '🔍 Maç Ara ve Ekle', callback_data: 'search_match' }],
+            [{ text: '📋 Global Takip Listesi', callback_data: 'list_tracked' }]
+        ];
+        bot.sendMessage(chatId, `👑 *Admin Paneli*\nİşlem seçin:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } });
+    } else {
+        renderList(chatId);
     }
-
-    bot.sendMessage(chatId, `🤖 *Raphael*\n\nCanlı skor ve maç bildirim sistemi.\nİşlem seçin:`, { parse_mode: 'Markdown', ...getMainMenu(chatId) });
 });
 
 bot.on('channel_post', (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
-    if (text && text.includes('/takip')) {
-        getUser(chatId);
-        sendTrackedList(chatId);
-    }
-});
-
-bot.on('callback_query', async (query) => {
-    const chatId = query.message.chat.id;
-    const messageId = query.message.message_id;
-    const chatType = query.message.chat.type;
-    const data = query.data;
-    const user = getUser(chatId);
-
-    if (data === 'search_match') {
-        user.state = 'waiting_for_search';
-        bot.sendMessage(chatId, '🔍 Takım veya lig adı yazın:');
-        bot.answerCallbackQuery(query.id);
-    } 
-    else if (data === 'list_tracked') {
-        if (user.tracked.size === 0) {
-            bot.answerCallbackQuery(query.id, { text: 'Listeniz boş.', show_alert: true });
-        } else {
-            bot.answerCallbackQuery(query.id, { text: 'Yükleniyor...' });
-            sendTrackedList(chatId, messageId);
-        }
-    }
-    else if (data === 'toggle_system') {
-        user.isActive = !user.isActive;
-        bot.editMessageReplyMarkup(getMainMenu(chatId).reply_markup, { chat_id: chatId, message_id: messageId });
-        bot.answerCallbackQuery(query.id, { text: `Sistem ${user.isActive ? 'AÇILDI' : 'KAPATILDI'}`, show_alert: true });
-    }
-    else if (data.startsWith('add_')) {
-        const matchId = data.split('_')[1];
-        user.tracked.add(matchId);
-        bot.answerCallbackQuery(query.id, { text: '✅ Eklendi' });
-        bot.deleteMessage(chatId, messageId).catch(() => {});
-        sendMatchDetails(chatId, matchId, true, chatType);
-    }
-    else if (data.startsWith('rem_')) {
-        const matchId = data.split('_')[1];
-        user.tracked.delete(matchId);
-        bot.deleteMessage(chatId, messageId).catch(() => {});
-        bot.answerCallbackQuery(query.id, { text: '🗑 Silindi' });
-        if (chatType === 'private') {
-            bot.sendMessage(chatId, 'Silindi.', getMainMenu(chatId));
-        }
-    }
-    else if (data.startsWith('pred_')) {
-        const matchId = data.split('_')[1];
-        sendPrediction(chatId, matchId);
-        bot.answerCallbackQuery(query.id);
-    }
-    else if (data.startsWith('refresh_')) {
-        const matchId = data.split('_')[1];
-        bot.answerCallbackQuery(query.id, { text: '🔄 Yenileniyor...' });
-        bot.deleteMessage(chatId, messageId).catch(() => {});
-        sendMatchDetails(chatId, matchId, false, chatType);
-    }
-    else if (data.startsWith('detail_')) {
-        const matchId = data.split('_')[1];
-        bot.answerCallbackQuery(query.id);
-        bot.deleteMessage(chatId, messageId).catch(() => {});
-        sendMatchDetails(chatId, matchId, false, chatType);
-    }
-    else if (data === 'back_main') {
-        if (chatType === 'private') {
-            bot.editMessageText(`🤖 *Raphael*\n\nCanlı skor ve maç bildirim sistemi.\nİşlem seçin:`, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', ...getMainMenu(chatId) });
-        } else {
-            bot.deleteMessage(chatId, messageId).catch(() => {});
-        }
-        bot.answerCallbackQuery(query.id);
-    }
-    else if (data === 'admin_panel') {
-        if (String(chatId) === adminId) {
-            const totalUsers = Object.keys(users).length;
-            let activeTrackCount = 0;
-            Object.values(users).forEach(u => activeTrackCount += u.tracked.size);
-            
-            const adminMsg = `👑 *Admin*\n\nKullanıcı: ${totalUsers}\nTakip: ${activeTrackCount}`;
-            const adminKb = {
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: '🔙 Menü', callback_data: 'back_main' }]
-                    ]
-                }
-            };
-            bot.editMessageText(adminMsg, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', ...adminKb });
-        }
-        bot.answerCallbackQuery(query.id);
+    if (text && text.match(/^\/takip(?:@\w+)?$/)) {
+        activeChats.add(chatId);
+        renderList(chatId);
     }
 });
 
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text;
-    const user = getUser(chatId);
+    activeChats.add(chatId);
 
     if (!text || text.startsWith('/')) return;
 
-    if (user.state === 'waiting_for_search') {
-        user.state = 'idle';
-        bot.sendMessage(chatId, '⏳ Taranıyor...');
+    if (String(chatId) === adminId && matchStates['admin_search_mode']) {
+        matchStates['admin_search_mode'] = false;
+        bot.sendMessage(chatId, '⏳ Aranıyor...');
         searchMatches(chatId, text);
+    }
+});
+
+bot.on('callback_query', async (query) => {
+    const chatId = query.message.chat.id;
+    const messageId = query.message.message_id;
+    const data = query.data;
+    activeChats.add(chatId);
+
+    if (data === 'search_match' && String(chatId) === adminId) {
+        matchStates['admin_search_mode'] = true;
+        bot.sendMessage(chatId, '🔍 Takım veya lig adı yazın:');
+        bot.answerCallbackQuery(query.id);
+    } 
+    else if (data === 'list_tracked' || data === 'back_main') {
+        bot.answerCallbackQuery(query.id);
+        renderList(chatId, messageId);
+    }
+    else if (data.startsWith('add_') && String(chatId) === adminId) {
+        const matchId = data.split('_')[1];
+        globalTrackedMatches.add(matchId);
+        bot.answerCallbackQuery(query.id, { text: '✅ Küresel listeye eklendi' });
+        bot.deleteMessage(chatId, messageId).catch(() => {});
+        renderDetail(chatId, messageId, matchId, true);
+    }
+    else if (data.startsWith('rem_') && String(chatId) === adminId) {
+        const matchId = data.split('_')[1];
+        globalTrackedMatches.delete(matchId);
+        bot.answerCallbackQuery(query.id, { text: '🗑 Küresel listeden silindi' });
+        renderList(chatId, messageId);
+    }
+    else if (data.startsWith('detail_')) {
+        const matchId = data.split('_')[1];
+        bot.answerCallbackQuery(query.id);
+        renderDetail(chatId, messageId, matchId);
+    }
+    else if (data.startsWith('analiz_')) {
+        const matchId = data.split('_')[1];
+        bot.answerCallbackQuery(query.id);
+        renderAnalysis(chatId, messageId, matchId);
+    }
+    else if (data.startsWith('refreshlist_')) {
+        bot.answerCallbackQuery(query.id, { text: '🔄 Liste Yenileniyor...' });
+        renderList(chatId, messageId);
+    }
+    else if (data.startsWith('refreshdetail_')) {
+        const matchId = data.split('_')[1];
+        bot.answerCallbackQuery(query.id, { text: '🔄 Maç Yenileniyor...' });
+        renderDetail(chatId, messageId, matchId);
+    }
+    else if (data.startsWith('refreshanaliz_')) {
+        const matchId = data.split('_')[1];
+        bot.answerCallbackQuery(query.id, { text: '🔄 Analiz Yenileniyor...' });
+        renderAnalysis(chatId, messageId, matchId);
+    }
+    else if (data === 'dummy') {
+        bot.answerCallbackQuery(query.id, { text: 'Zaten ekli!', show_alert: true });
     }
 });
 
@@ -204,7 +152,7 @@ async function searchMatches(chatId, queryText) {
         });
 
         if (filtered.length === 0) {
-            bot.sendMessage(chatId, `❌ Bulunamadı.`, getMainMenu(chatId));
+            bot.sendMessage(chatId, `❌ Bulunamadı.`);
             return;
         }
 
@@ -216,31 +164,33 @@ async function searchMatches(chatId, queryText) {
             const home = comp.competitors.find(c => c.homeAway === 'home');
             const away = comp.competitors.find(c => c.homeAway === 'away');
             const rawStatus = match.status.type.detail;
-            const dateStr = match.date;
-            const status = translateStatus(rawStatus, dateStr);
+            const status = translateStatus(rawStatus, match.date);
             const isLive = match.status.type.state === 'in';
+            const isTracked = globalTrackedMatches.has(String(match.id));
 
-            const btnText = `${isLive ? '🔴' : '⚪'} ${home.team.displayName} ${home.score ?? ''} - ${away.score ?? ''} ${away.team.displayName} [${status}]`;
-            inline_keyboard.push([{ text: btnText, callback_data: `add_${match.id}` }]);
+            if (isTracked) {
+                inline_keyboard.push([{ text: `✅ Ekli: ${home.team.displayName} - ${away.team.displayName}`, callback_data: `dummy` }]);
+            } else {
+                inline_keyboard.push([{ text: `${isLive ? '🔴' : '⚪'} ${home.team.displayName} ${home.score ?? ''} - ${away.score ?? ''} ${away.team.displayName} [${status}]`, callback_data: `add_${match.id}` }]);
+            }
         });
 
         bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard } });
-
     } catch (error) {
         bot.sendMessage(chatId, '❌ API Hatası.');
     }
 }
 
-async function sendTrackedList(chatId, messageId = null) {
-    const user = getUser(chatId);
-    const trackedArr = Array.from(user.tracked);
+async function renderList(chatId, messageId = null) {
+    const trackedArr = Array.from(globalTrackedMatches);
     
     if (trackedArr.length === 0) {
         const emptyMsg = '📋 Takip edilen maç bulunmuyor.';
+        const kb = { inline_keyboard: [[{ text: '🔄 Yenile', callback_data: 'refreshlist_' }]] };
         if (messageId) {
-            bot.editMessageText(emptyMsg, { chat_id: chatId, message_id: messageId }).catch(() => {});
+            bot.editMessageText(emptyMsg, { chat_id: chatId, message_id: messageId, reply_markup: kb }).catch(() => {});
         } else {
-            bot.sendMessage(chatId, emptyMsg);
+            bot.sendMessage(chatId, emptyMsg, { reply_markup: kb });
         }
         return;
     }
@@ -252,13 +202,15 @@ async function sendTrackedList(chatId, messageId = null) {
             const comp = response.data.header.competitions[0];
             const home = comp.competitors.find(c => c.homeAway === 'home');
             const away = comp.competitors.find(c => c.homeAway === 'away');
-            kb.push([{ text: `⚽ ${home.team.displayName} ${home.score ?? '-'} - ${away.score ?? '-'} ${away.team.displayName}`, callback_data: `detail_${matchId}` }]);
+            const isLive = comp.status.type.state === 'in';
+            const icon = isLive ? '🔴' : '⚪';
+            kb.push([{ text: `${icon} ${home.team.displayName} ${home.score ?? '-'} - ${away.score ?? '-'} ${away.team.displayName}`, callback_data: `detail_${matchId}` }]);
         } catch (e) {}
     }
     
-    kb.push([{ text: '🔙 Geri Dön', callback_data: 'back_main' }]);
+    kb.push([{ text: '🔄 Yenile', callback_data: 'refreshlist_' }]);
     
-    const msgText = `📋 *Takip Edilen Maçlar*`;
+    const msgText = `📋 *Canlı Takip Listesi*`;
     const options = { parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } };
 
     if (messageId) {
@@ -270,7 +222,7 @@ async function sendTrackedList(chatId, messageId = null) {
     }
 }
 
-async function sendMatchDetails(chatId, matchId, isNew = false, chatType = 'private') {
+async function renderDetail(chatId, messageId, matchId, isNew = false) {
     try {
         const response = await axios.get(`https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary?event=${matchId}`);
         const data = response.data;
@@ -278,9 +230,7 @@ async function sendMatchDetails(chatId, matchId, isNew = false, chatType = 'priv
         
         const home = comp.competitors.find(c => c.homeAway === 'home');
         const away = comp.competitors.find(c => c.homeAway === 'away');
-        const rawStatus = comp.status.type.detail;
-        const dateStr = comp.date;
-        const status = translateStatus(rawStatus, dateStr);
+        const status = translateStatus(comp.status.type.detail, comp.date);
         const isLive = comp.status.type.state === 'in';
 
         let text = `${isNew ? '✅ *EKLENDİ*\n\n' : ''}`;
@@ -292,32 +242,28 @@ async function sendMatchDetails(chatId, matchId, isNew = false, chatType = 'priv
             text += `📌 ${lastEvent.type.text} (${lastEvent.clock?.displayValue || ''}')\n`;
         }
 
-        let inline_keyboard = [
+        let kb = [
             [
-                { text: '📊 Analiz', callback_data: `pred_${matchId}` },
-                { text: '🔄 Yenile', callback_data: `refresh_${matchId}` }
+                { text: '📊 Analiz', callback_data: `analiz_${matchId}` },
+                { text: '🔄 Yenile', callback_data: `refreshdetail_${matchId}` }
             ]
         ];
 
-        if (chatType === 'private') {
-            inline_keyboard.push([
-                { text: '🗑 Çıkar', callback_data: `rem_${matchId}` },
-                { text: '🔙 Geri Dön', callback_data: `list_tracked` }
-            ]);
-        } else {
-            inline_keyboard.push([
-                { text: '🔙 Geri Dön', callback_data: `list_tracked` }
-            ]);
+        if (String(chatId) === adminId) {
+            kb.push([{ text: '🗑 Listeden Çıkar', callback_data: `rem_${matchId}` }]);
         }
+        
+        kb.push([{ text: '🔙 Geri Dön', callback_data: `back_main` }]);
 
-        bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard } });
-    } catch (e) {
-        const user = getUser(chatId);
-        user.tracked.delete(matchId);
-    }
+        if (messageId && !isNew) {
+            bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } }).catch(() => {});
+        } else {
+            bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } });
+        }
+    } catch (e) {}
 }
 
-async function sendPrediction(chatId, matchId) {
+async function renderAnalysis(chatId, messageId, matchId) {
     try {
         const response = await axios.get(`https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary?event=${matchId}`);
         const data = response.data;
@@ -339,30 +285,35 @@ async function sendPrediction(chatId, matchId) {
             let baseAway = 20 + (aId % 25); 
             let tie = 100 - baseHome - baseAway;
             if (tie < 10) { tie = 15; baseHome -= 3; baseAway -= 2; }
-            
             hPct = baseHome.toFixed(1);
             tPct = tie.toFixed(1);
             aPct = baseAway.toFixed(1);
         }
 
-        const msg = `📊 *Analiz*\n\n` +
+        const msg = `📊 *Analiz Verileri*\n\n` +
                     `1️⃣ *${home.displayName}*: %${hPct}\n` +
                     `✖️ *Beraberlik*: %${tPct}\n` +
                     `2️⃣ *${away.displayName}*: %${aPct}`;
 
-        bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-    } catch (e) {
-        bot.sendMessage(chatId, '❌ Analiz bulunamadı.');
-    }
+        const kb = [
+            [
+                { text: '🏟 Maç Sonucu', callback_data: `detail_${matchId}` },
+                { text: '🔄 Yenile', callback_data: `refreshanaliz_${matchId}` }
+            ],
+            [
+                { text: '🔙 Geri Dön', callback_data: `back_main` }
+            ]
+        ];
+
+        bot.editMessageText(msg, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } }).catch(() => {});
+    } catch (e) {}
 }
 
 setInterval(async () => {
-    const activeMatchIds = new Set();
-    Object.keys(users).forEach(chatId => {
-        if (users[chatId].isActive) users[chatId].tracked.forEach(id => activeMatchIds.add(id));
-    });
+    if (isFetching || globalTrackedMatches.size === 0) return;
+    isFetching = true;
 
-    for (const matchId of activeMatchIds) {
+    for (const matchId of Array.from(globalTrackedMatches)) {
         try {
             const response = await axios.get(`https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary?event=${matchId}`);
             const data = response.data;
@@ -385,13 +336,11 @@ setInterval(async () => {
             const newStatus = comp.status.type.name;
 
             if (newStatus === 'STATUS_FULL_TIME' || state.status === 'STATUS_FULL_TIME') {
-                if (!state.finishedAt) {
-                    state.finishedAt = Date.now();
-                }
+                if (!state.finishedAt) state.finishedAt = Date.now();
             }
 
             if (state.finishedAt && Date.now() - state.finishedAt > 900000) {
-                Object.values(users).forEach(u => u.tracked.delete(matchId));
+                globalTrackedMatches.delete(matchId);
                 delete matchStates[matchId];
                 continue;
             }
@@ -410,21 +359,21 @@ setInterval(async () => {
                     let alertMsg = null;
 
                     if (eType.includes('goal') || eType.includes('penalty')) {
-                        alertMsg = `🚨 *GOL*\n\n` +
-                                   `🏟 *${home.team.displayName} ${home.score} - ${away.score} ${away.team.displayName}*\n` +
-                                   `👤 ${athlete} (${teamName})\n` +
-                                   `⏱ ${eTime}' ${extraStr}`;
+                        let isMissed = eType.includes('miss');
+                        if (isMissed) {
+                            alertMsg = `❌ *PENALTI KAÇTI*\n\n🏟 *${home.team.displayName} ${home.score} - ${away.score} ${away.team.displayName}*\n👤 ${athlete} (${teamName})\n⏱ ${eTime}'`;
+                        } else {
+                            alertMsg = `🚨 *GOL*\n\n🏟 *${home.team.displayName} ${home.score} - ${away.score} ${away.team.displayName}*\n👤 ${athlete} (${teamName})\n⏱ ${eTime}' ${extraStr}`;
+                        }
                     } 
                     else if (eType.includes('red card')) {
-                        alertMsg = `🟥 *KIRMIZI KART*\n\n` +
-                                   `🏟 *${home.team.displayName} ${home.score} - ${away.score} ${away.team.displayName}*\n` +
-                                   `👤 ${athlete} (${teamName})\n` +
-                                   `⏱ ${eTime}'`;
+                        alertMsg = `🟥 *KIRMIZI KART*\n\n🏟 *${home.team.displayName} ${home.score} - ${away.score} ${away.team.displayName}*\n👤 ${athlete} (${teamName})\n⏱ ${eTime}'`;
+                    }
+                    else if (eType.includes('disallowed') || eType.includes('var')) {
+                        alertMsg = `🖥 *VAR KARARI / İPTAL*\n\n🏟 *${home.team.displayName} ${home.score} - ${away.score} ${away.team.displayName}*\n📌 ${event.type.text}\n⏱ ${eTime}'`;
                     }
 
-                    if (alertMsg) {
-                        broadcastToTrackers(matchId, alertMsg);
-                    }
+                    if (alertMsg) broadcastToTrackers(alertMsg);
                 }
             });
 
@@ -442,22 +391,20 @@ setInterval(async () => {
                     statusMsg = `🎯 *PENALTILAR*\n🏟 ${home.team.displayName} ${home.score} - ${away.score} ${away.team.displayName}`;
                 }
 
-                if (statusMsg) {
-                    broadcastToTrackers(matchId, statusMsg);
-                }
+                if (statusMsg) broadcastToTrackers(statusMsg);
             }
 
             state.score = currentScore;
-
         } catch (error) {}
     }
+    
+    isFetching = false;
 }, 10000);
 
-function broadcastToTrackers(matchId, message) {
-    Object.keys(users).forEach(chatId => {
-        const u = users[chatId];
-        if (u.isActive && u.tracked.has(matchId)) {
-            bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-        }
+function broadcastToTrackers(message) {
+    Array.from(activeChats).forEach(chatId => {
+        bot.sendMessage(chatId, message, { parse_mode: 'Markdown' }).catch(() => {
+            activeChats.delete(chatId);
+        });
     });
 }
