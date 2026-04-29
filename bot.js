@@ -69,15 +69,31 @@ bot.onText(/\/(start|takip)/, (msg, match) => {
     const chatType = msg.chat.type;
     const cmd = match[1];
 
-    if (chatType !== 'private' && cmd === 'start') return;
-
     getUser(chatId);
+
+    if (chatType !== 'private') {
+        if (cmd === 'takip') {
+            sendTrackedList(chatId);
+        }
+        return;
+    }
+
     bot.sendMessage(chatId, `🤖 *Raphael*\n\nCanlı skor ve maç bildirim sistemi.\nİşlem seçin:`, { parse_mode: 'Markdown', ...getMainMenu(chatId) });
+});
+
+bot.on('channel_post', (msg) => {
+    const chatId = msg.chat.id;
+    const text = msg.text;
+    if (text && text.includes('/takip')) {
+        getUser(chatId);
+        sendTrackedList(chatId);
+    }
 });
 
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const messageId = query.message.message_id;
+    const chatType = query.message.chat.type;
     const data = query.data;
     const user = getUser(chatId);
 
@@ -88,8 +104,7 @@ bot.on('callback_query', async (query) => {
     } 
     else if (data === 'list_tracked') {
         if (user.tracked.size === 0) {
-            bot.sendMessage(chatId, '📋 Listeniz boş.', getMainMenu(chatId));
-            bot.answerCallbackQuery(query.id);
+            bot.answerCallbackQuery(query.id, { text: 'Listeniz boş.', show_alert: true });
         } else {
             bot.answerCallbackQuery(query.id, { text: 'Yükleniyor...' });
             sendTrackedList(chatId, messageId);
@@ -105,14 +120,16 @@ bot.on('callback_query', async (query) => {
         user.tracked.add(matchId);
         bot.answerCallbackQuery(query.id, { text: '✅ Eklendi' });
         bot.deleteMessage(chatId, messageId).catch(() => {});
-        sendMatchDetails(chatId, matchId, true);
+        sendMatchDetails(chatId, matchId, true, chatType);
     }
     else if (data.startsWith('rem_')) {
         const matchId = data.split('_')[1];
         user.tracked.delete(matchId);
         bot.deleteMessage(chatId, messageId).catch(() => {});
         bot.answerCallbackQuery(query.id, { text: '🗑 Silindi' });
-        bot.sendMessage(chatId, 'Silindi.', getMainMenu(chatId));
+        if (chatType === 'private') {
+            bot.sendMessage(chatId, 'Silindi.', getMainMenu(chatId));
+        }
     }
     else if (data.startsWith('pred_')) {
         const matchId = data.split('_')[1];
@@ -123,16 +140,20 @@ bot.on('callback_query', async (query) => {
         const matchId = data.split('_')[1];
         bot.answerCallbackQuery(query.id, { text: '🔄 Yenileniyor...' });
         bot.deleteMessage(chatId, messageId).catch(() => {});
-        sendMatchDetails(chatId, matchId, false);
+        sendMatchDetails(chatId, matchId, false, chatType);
     }
     else if (data.startsWith('detail_')) {
         const matchId = data.split('_')[1];
         bot.answerCallbackQuery(query.id);
         bot.deleteMessage(chatId, messageId).catch(() => {});
-        sendMatchDetails(chatId, matchId, false);
+        sendMatchDetails(chatId, matchId, false, chatType);
     }
     else if (data === 'back_main') {
-        bot.editMessageText(`🤖 *Raphael*\n\nCanlı skor ve maç bildirim sistemi.\nİşlem seçin:`, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', ...getMainMenu(chatId) });
+        if (chatType === 'private') {
+            bot.editMessageText(`🤖 *Raphael*\n\nCanlı skor ve maç bildirim sistemi.\nİşlem seçin:`, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', ...getMainMenu(chatId) });
+        } else {
+            bot.deleteMessage(chatId, messageId).catch(() => {});
+        }
         bot.answerCallbackQuery(query.id);
     }
     else if (data === 'admin_panel') {
@@ -145,19 +166,11 @@ bot.on('callback_query', async (query) => {
             const adminKb = {
                 reply_markup: {
                     inline_keyboard: [
-                        [{ text: '📢 Duyuru', callback_data: 'admin_broadcast' }],
                         [{ text: '🔙 Menü', callback_data: 'back_main' }]
                     ]
                 }
             };
             bot.editMessageText(adminMsg, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', ...adminKb });
-        }
-        bot.answerCallbackQuery(query.id);
-    }
-    else if (data === 'admin_broadcast') {
-        if (String(chatId) === adminId) {
-            user.state = 'waiting_for_broadcast';
-            bot.sendMessage(chatId, '📢 Duyuru metnini yazın:');
         }
         bot.answerCallbackQuery(query.id);
     }
@@ -174,28 +187,6 @@ bot.on('message', async (msg) => {
         user.state = 'idle';
         bot.sendMessage(chatId, '⏳ Taranıyor...');
         searchMatches(chatId, text);
-    }
-    else if (user.state === 'waiting_for_broadcast' && String(chatId) === adminId) {
-        user.state = 'idle';
-        let successCount = 0;
-        const userIds = Object.keys(users);
-        
-        for (const uid of userIds) {
-            try {
-                await bot.sendMessage(uid, `📢 *Sistem Duyurusu*\n\n${text}`, { parse_mode: 'Markdown' });
-                successCount++;
-            } catch (err) {}
-        }
-        bot.sendMessage(chatId, `✅ İletildi: ${successCount}`, getMainMenu(chatId));
-    }
-});
-
-bot.on('channel_post', (msg) => {
-    const chatId = msg.chat.id;
-    const text = msg.text;
-    if (text && text.includes('/takip')) {
-        getUser(chatId);
-        bot.sendMessage(chatId, `🤖 *Raphael*\nİşlem seçin:`, { parse_mode: 'Markdown', ...getMainMenu(chatId) });
     }
 });
 
@@ -236,14 +227,24 @@ async function searchMatches(chatId, queryText) {
         bot.sendMessage(chatId, msgText, { parse_mode: 'Markdown', reply_markup: { inline_keyboard } });
 
     } catch (error) {
-        bot.sendMessage(chatId, '❌ API Hatası.', getMainMenu(chatId));
+        bot.sendMessage(chatId, '❌ API Hatası.');
     }
 }
 
-async function sendTrackedList(chatId, messageId) {
+async function sendTrackedList(chatId, messageId = null) {
     const user = getUser(chatId);
     const trackedArr = Array.from(user.tracked);
     
+    if (trackedArr.length === 0) {
+        const emptyMsg = '📋 Takip edilen maç bulunmuyor.';
+        if (messageId) {
+            bot.editMessageText(emptyMsg, { chat_id: chatId, message_id: messageId }).catch(() => {});
+        } else {
+            bot.sendMessage(chatId, emptyMsg);
+        }
+        return;
+    }
+
     let kb = [];
     for (const matchId of trackedArr) {
         try {
@@ -254,14 +255,22 @@ async function sendTrackedList(chatId, messageId) {
             kb.push([{ text: `⚽ ${home.team.displayName} ${home.score ?? '-'} - ${away.score ?? '-'} ${away.team.displayName}`, callback_data: `detail_${matchId}` }]);
         } catch (e) {}
     }
-    kb.push([{ text: '🔙 Menü', callback_data: 'back_main' }]);
     
-    bot.editMessageText(`📋 *Takip Listesi*\nSeçim yapın:`, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } }).catch(() => {
-        bot.sendMessage(chatId, `📋 *Takip Listesi*\nSeçim yapın:`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } });
-    });
+    kb.push([{ text: '🔙 Geri Dön', callback_data: 'back_main' }]);
+    
+    const msgText = `📋 *Takip Edilen Maçlar*`;
+    const options = { parse_mode: 'Markdown', reply_markup: { inline_keyboard: kb } };
+
+    if (messageId) {
+        bot.editMessageText(msgText, { chat_id: chatId, message_id: messageId, ...options }).catch(() => {
+            bot.sendMessage(chatId, msgText, options);
+        });
+    } else {
+        bot.sendMessage(chatId, msgText, options);
+    }
 }
 
-async function sendMatchDetails(chatId, matchId, isNew = false) {
+async function sendMatchDetails(chatId, matchId, isNew = false, chatType = 'private') {
     try {
         const response = await axios.get(`https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary?event=${matchId}`);
         const data = response.data;
@@ -283,16 +292,23 @@ async function sendMatchDetails(chatId, matchId, isNew = false) {
             text += `📌 ${lastEvent.type.text} (${lastEvent.clock?.displayValue || ''}')\n`;
         }
 
-        const inline_keyboard = [
+        let inline_keyboard = [
             [
                 { text: '📊 Analiz', callback_data: `pred_${matchId}` },
                 { text: '🔄 Yenile', callback_data: `refresh_${matchId}` }
-            ],
-            [
-                { text: '🗑 Çıkar', callback_data: `rem_${matchId}` },
-                { text: '🔙 Liste', callback_data: `list_tracked` }
             ]
         ];
+
+        if (chatType === 'private') {
+            inline_keyboard.push([
+                { text: '🗑 Çıkar', callback_data: `rem_${matchId}` },
+                { text: '🔙 Geri Dön', callback_data: `list_tracked` }
+            ]);
+        } else {
+            inline_keyboard.push([
+                { text: '🔙 Geri Dön', callback_data: `list_tracked` }
+            ]);
+        }
 
         bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard } });
     } catch (e) {
@@ -358,13 +374,27 @@ setInterval(async () => {
                 matchStates[matchId] = {
                     score: `${home.score}-${away.score}`,
                     status: comp.status.type.name,
-                    notifiedEvents: new Set()
+                    notifiedEvents: new Set(),
+                    finishedAt: null
                 };
             }
 
             const state = matchStates[matchId];
             const currentScore = `${home.score}-${away.score}`;
             const keyEvents = data.keyEvents || [];
+            const newStatus = comp.status.type.name;
+
+            if (newStatus === 'STATUS_FULL_TIME' || state.status === 'STATUS_FULL_TIME') {
+                if (!state.finishedAt) {
+                    state.finishedAt = Date.now();
+                }
+            }
+
+            if (state.finishedAt && Date.now() - state.finishedAt > 900000) {
+                Object.values(users).forEach(u => u.tracked.delete(matchId));
+                delete matchStates[matchId];
+                continue;
+            }
 
             keyEvents.forEach(event => {
                 if (!state.notifiedEvents.has(event.id)) {
@@ -398,8 +428,7 @@ setInterval(async () => {
                 }
             });
 
-            if (state.status !== comp.status.type.name) {
-                const newStatus = comp.status.type.name;
+            if (state.status !== newStatus) {
                 state.status = newStatus;
 
                 let statusMsg = null;
